@@ -37,10 +37,11 @@ def get_case(data):
 def sample(case_id, when, temp, rh, co2, door, note):
     row = execute_returning(
         '''INSERT INTO environment_samples
-           (case_id, sampled_at, temperature, humidity, co2_ppm, door_open, source, state, note, created_by)
-           VALUES (%s,%s,%s,%s,%s,%s,'seed','accepted',%s,NULL)
+           (case_id, sampled_at, temperature, humidity, co2_ppm, door_open, source, state, note, created_by,
+            received_at, is_late)
+           VALUES (%s,%s,%s,%s,%s,%s,'seed','accepted',%s,NULL,%s,FALSE)
            ON CONFLICT (case_id, sampled_at) DO NOTHING RETURNING id''',
-        (case_id, when, temp, rh, co2, door, note),
+        (case_id, when, temp, rh, co2, door, note, when),
     )
     if row:
         return row['id']

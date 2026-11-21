@@ -25,8 +25,19 @@
 - 门磁开启段的异常事件进入 `door_interference` 观察类型，必须完成 `verify_door_sealed` 后才能关闭，不能直接判定设备故障。
 - 连续三个异常采样点升级为 `critical / escalated`，需要主管追加 `call_curator` 动作。
 - 没有已完成值守动作，或最近一次文物巡检不是 `pass`，主管不能关闭事件。
-- 同一展柜采样间隔超过 30 分钟会被拒绝，要求补齐缺测时段。
+- 同一展柜采样间隔超过 30 分钟会被拒绝，要求补齐缺测时段；离线补传通道例外，断档进入 `measurement_gaps` 缺测台账。
 - viewer 只能读取，operator 可录入采样和执行值守/巡检，supervisor 才能创建展柜和关闭异常。
+
+## 离线补传与重算追溯
+
+离线网关恢复后，历史采样通过 `POST /cases/{case_id}/backfill` 补传，遵循以下闭环口径。
+
+- **按采样时间入库、幂等去重**。补传以 `sampled_at` 为准写入，`UNIQUE(case_id, sampled_at)` 与 `ON CONFLICT DO NOTHING` 保证重复提交不新增采样、不覆盖原始来源；迟到数据打 `is_late` 标记并记录 `received_at` 与补传批次。
+- **缺测不静默填正常**。超过 30 分钟的相邻间隔只登记 `measurement_gaps`（开放/已补齐、发现批次、补齐批次），系统从不生成虚假采样；连续异常计数遇到开放断档重新开始，馆长升级不会跨缺测误判。
+- **只重建未处置事件**。重算在单事务内进行，`status='closed'` 的事件冻结，保留原判定、值守动作与文物巡检证据；未关闭事件按新版候选对账，新增/更新/撤销均保留旧版本（`revision_status='superseded'`）。
+- **变化可追溯**。每次重算把合并、拆分、升级增减、类型变化与前后快照写入 `anomaly_event_versions`，异常页面展示来源与重算血缘，业务核验的「异常重算前后血缘」「离线补传采样溯源」「缺测断档台账」「重算失败待处理展柜」支持筛选与 CSV 导出。
+- **失败保留旧版**。重算异常时事务回滚，算法任务置 `retry_pending`、展柜置 `failed_pending` 并记录原因，旧版结果继续生效；主管通过 `POST /cases/{case_id}/rerun-retry` 手动重试。
+- 展柜 `rerun_state` 取值 `current / stale / failed_pending`，算法任务 `kind` 区分 `analysis / backfill_rerun / retry`。
 
 ## 快速启动
 
@@ -77,11 +88,11 @@ Compose 恰好包含 `frontend`、`backend`、`worker`、`db`、`redis` 五个�
 
 输入为同一展柜按时间排序的 `[temperature_c, relative_humidity_pct, co2_ppm]`。worker 先使用 `RobustScaler` 按中位数和四分位距变换，再用 `IsolationForest(n_estimators=160, contamination=0.22, random_state=1069)` 输出 `decision_function` 分数和离群标签。低于 22% 分位阈值的样本形成异常候选。
 
-门开采样只改变业务分类为门开干扰。连续异常计数由时间序列中的连续离群样本计算，达到 3 个时升级。少于 6 条有效采样时算法任务失败并把错误写入 `algorithm_runs.error`，便于重试。
+门开采样只改变业务分类为门开干扰。连续异常计数由时间序列中的连续离群样本计算，达到 3 个时升级，且计数不跨越 `measurement_gaps` 中的开放缺测段。少于 6 条有效采样时算法任务失败并把错误写入 `algorithm_runs.error`，便于重试。重算对账逻辑集中在 `src/services/backfill_domain.py` 的纯函数中，事务落库由 `src/services/repository.py` 完成，已关闭事件不参与重建。
 
 ## 枚举出现位置
 
-- `CASE_STATUSES`、`ANOMALY_STATUSES`、`ANOMALY_TYPES`、`DUTY_ACTION_TYPES`、`CHECK_RESULTS` 位于 `backend/src/constants/enums.py`，数据库约束位于 `backend/migrations/001_init.sql`，前端展示映射位于 `frontend/src/app.js`。
+- `CASE_STATUSES`、`ANOMALY_STATUSES`、`ANOMALY_TYPES`、`DUTY_ACTION_TYPES`、`CHECK_RESULTS`、`SAMPLE_SOURCES`、`REVISION_STATUSES`、`RERUN_STATES`、`VERSION_CHANGE_TYPES`、`GAP_STATES`、`RUN_KINDS` 位于 `backend/src/constants/enums.py`，数据库约束位于 `backend/migrations/001_init.sql` 与 `002_backfill_lineage.sql`，前端展示映射位于 `frontend/src/app.js`。
 - 角色 `operator / supervisor / viewer` 位于用户表约束、JWT 依赖 `backend/src/middlewares/auth.py`、路由依赖和前端用户状态中。
 - 事件生命周期与值守动作的前置条件位于 `backend/src/main.py` 的异常、值守、巡检和关闭路由。
 
@@ -90,16 +101,29 @@ Compose 恰好包含 `frontend`、`backend`、`worker`、`db`、`redis` 五个�
 ```text
 backend/
   migrations/001_init.sql
+  migrations/002_backfill_lineage.sql
   scripts/seed_demo.py
   src/main.py
-  src/services/algorithm.py
   src/worker.py
+  src/services/algorithm.py
+  src/services/backfill_domain.py
+  src/services/backfill_service.py
+  src/services/repository.py
+  tests/
 frontend/
   index.html
   nginx.conf
   src/app.js
   src/styles.css
 docker-compose.yml
+```
+
+## 测试
+
+无需 Docker 或 PostgreSQL，领域与编排测试用内存假仓储运行：
+
+```bash
+cd backend && python3 -m pytest tests -q
 ```
 
 ## License

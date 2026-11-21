@@ -1,13 +1,13 @@
 import json
 import os
-import time
 from datetime import datetime, timezone
 
 import redis
 
 from src.config.settings import REDIS_URL
 from src.services.algorithm import run_case_analysis
-from src.utils.db import execute, fetch_one, wait_for_db
+from src.services import repository
+from src.utils.db import execute, wait_for_db
 
 QUEUE = 'museum_case_anomaly_jobs'
 HEARTBEAT = '/shared/worker-heartbeat'
@@ -17,6 +17,17 @@ def heartbeat():
     os.makedirs('/shared', exist_ok=True)
     with open(HEARTBEAT, 'w', encoding='utf-8') as handle:
         handle.write(datetime.now(timezone.utc).isoformat())
+
+
+def process_job(job: dict) -> None:
+    run_id = int(job['run_id'])
+    case_id = int(job['case_id'])
+    repository.mark_run_running(run_id)
+    try:
+        run_case_analysis(case_id, run_id)
+    except Exception as exc:
+        # 重算失败：事务已回滚，旧版事件与巡检证据完整保留，仅标记待处理
+        repository.mark_run_failed_pending(run_id, case_id, str(exc))
 
 
 def main():
@@ -29,12 +40,7 @@ def main():
             continue
         _, payload = item
         job = json.loads(payload)
-        run_id = int(job['run_id'])
-        try:
-            execute("UPDATE algorithm_runs SET status='running', updated_at=NOW() WHERE id=%s", (run_id,))
-            run_case_analysis(int(job['case_id']), run_id)
-        except Exception as exc:
-            execute("UPDATE algorithm_runs SET status='failed', error=%s, updated_at=NOW() WHERE id=%s", (str(exc), run_id))
+        process_job(job)
 
 
 if __name__ == '__main__':
